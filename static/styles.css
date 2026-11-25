@@ -1,0 +1,9 @@
+.quiz-opt.correct {
+  border-color: rgb(16 185 129) !important;
+  background-color: rgba(16, 185, 129, 0.08);
+}
+
+.quiz-opt.wrong {
+  border-color: rgb(239 68 68) !important;
+  background-color: rgba(239, 68, 68, 0.08);
+}
