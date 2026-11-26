@@ -23,7 +23,9 @@ from curriculum import CURRICULUM
 from curriculum_details import TOPIC_DETAILS
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or ""
+).strip()
 DEFAULT_SQLITE_PATH = (
     "/tmp/learning.db" if os.environ.get("VERCEL") else str(BASE_DIR / "learning.db")
 )
