@@ -65,6 +65,7 @@ const el = {
   openPlaygroundBtn: document.getElementById("openPlaygroundBtn"),
   playgroundModal: document.getElementById("playgroundModal"),
   closePlaygroundBtn: document.getElementById("closePlaygroundBtn"),
+  playgroundEditorContainer: document.getElementById("playgroundEditorContainer"),
   playgroundCode: document.getElementById("playgroundCode"),
   runCodeBtn: document.getElementById("runCodeBtn"),
   clearOutputBtn: document.getElementById("clearOutputBtn"),
@@ -134,6 +135,9 @@ function applyTheme(theme) {
     theme === "dark"
       ? `<i data-lucide="sun" class="w-4 h-4"></i>`
       : `<i data-lucide="moon" class="w-4 h-4"></i>`;
+  if (window.monaco && monacoEditor) {
+    window.monaco.editor.setTheme(theme === "dark" ? "vs-dark" : "vs");
+  }
   refreshIcons();
 }
 
@@ -605,9 +609,193 @@ function renderLessonTab() {
   }
 }
 
-/* ---------- Playground (Pyodide in-browser + API fallback) ---------- */
+/* ---------- Playground (Monaco VS Code Editor + Pyodide + API fallback) ---------- */
 let pyodideInstance = null;
 let pyodideLoadingPromise = null;
+let monacoEditor = null;
+let monacoLoadPromise = null;
+let pendingPlaygroundCode = "print('Привіт, Python!')\nfor i in range(1, 6):\n    print(f'{i}^2 = {i**2}')";
+
+function registerPythonCompletions(monaco) {
+  const builtins = [
+    ["print", "print(${1:value})", "Вивести значення в консоль"],
+    ["len", "len(${1:obj})", "Повернути довжину об'єкта"],
+    ["range", "range(${1:start}, ${2:stop})", "Згенерувати послідовність чисел"],
+    ["enumerate", "enumerate(${1:iterable})", "Ітерація з індексом та значенням"],
+    ["zip", "zip(${1:iter1}, ${2:iter2})", "Об'єднати кілька послідовностей"],
+    ["sorted", "sorted(${1:iterable})", "Повернути відсортований список"],
+    ["sum", "sum(${1:iterable})", "Сума елементів"],
+    ["min", "min(${1:iterable})", "Мінімальний елемент"],
+    ["max", "max(${1:iterable})", "Максимальний елемент"],
+    ["isinstance", "isinstance(${1:obj}, ${2:type})", "Перевірити тип об'єкта"],
+    ["dict", "dict(${1:})", "Створити словник"],
+    ["list", "list(${1:iterable})", "Створити список"],
+    ["set", "set(${1:iterable})", "Створити множину"],
+    ["tuple", "tuple(${1:iterable})", "Створити кортеж"],
+    ["int", "int(${1:x})", "Перетворити в ціле число"],
+    ["float", "float(${1:x})", "Перетворити в дробове число"],
+    ["str", "str(${1:x})", "Перетворити в рядок"],
+    ["bool", "bool(${1:x})", "Перетворити в логічне значення"],
+    ["abs", "abs(${1:x})", "Модуль числа"],
+    ["round", "round(${1:number}, ${2:2})", "Округлити число"],
+    ["any", "any(${1:iterable})", "True, якщо хоча б один елемент істинний"],
+    ["all", "all(${1:iterable})", "True, якщо всі елементи істинні"],
+    ["open", "open(${1:'file.txt'}, '${2:r}', encoding='utf-8')", "Відкрити файл"],
+  ];
+
+  const snippets = [
+    ["def", "def ${1:func_name}(${2:args}) -> ${3:None}:\n    ${4:pass}", "Оголосити функцію"],
+    ["async def", "async def ${1:func_name}(${2:args}):\n    ${3:pass}", "Асинхронна функція"],
+    ["class", "class ${1:MyClass}:\n    def __init__(self, ${2:value}):\n        self.${2:value} = ${2:value}", "Оголосити клас"],
+    ["for", "for ${1:item} in ${2:items}:\n    ${3:print(item)}", "Цикл for"],
+    ["if", "if ${1:condition}:\n    ${2:pass}", "Умова if"],
+    ["try", "try:\n    ${1:pass}\nexcept ${2:Exception} as e:\n    print(e)", "Обробка помилок try/except"],
+    ["with", "with open(${1:'file.txt'}, '${2:r}', encoding='utf-8') as f:\n    ${3:data = f.read()}", "Контекстний менеджер with"],
+    ["match", "match ${1:value}:\n    case ${2:pattern}:\n        ${3:pass}\n    case _:\n        ${4:pass}", "Конструкція match/case"],
+    ["ifmain", "if __name__ == '__main__':\n    ${1:main()}", "Точка входу скрипта"],
+  ];
+
+  const methods = [
+    ["append", "append(${1:item})", "list: додати елемент у кінець"],
+    ["extend", "extend(${1:iterable})", "list: розширити список"],
+    ["pop", "pop(${1:})", "list/dict: видалити і повернути елемент"],
+    ["sort", "sort(${1:})", "list: відсортувати на місці"],
+    ["get", "get(${1:key}, ${2:None})", "dict: безпечно отримати значення"],
+    ["items", "items()", "dict: пари (ключ, значення)"],
+    ["keys", "keys()", "dict: усі ключі"],
+    ["values", "values()", "dict: усі значення"],
+    ["split", "split(${1:','})", "str: розбити рядок у список"],
+    ["join", "join(${1:items})", "str: з'єднати список у рядок"],
+    ["strip", "strip()", "str: прибрати пробіли по краях"],
+    ["replace", "replace(${1:old}, ${2:new})", "str: замінити підрядок"],
+    ["lower", "lower()", "str: нижній регістр"],
+    ["upper", "upper()", "str: верхній регістр"],
+  ];
+
+  monaco.languages.registerCompletionItemProvider("python", {
+    triggerCharacters: ["."],
+    provideCompletionItems(model, position) {
+      const word = model.getWordUntilPosition(position);
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      };
+      const linePrefix = model.getValueInRange({
+        startLineNumber: position.lineNumber,
+        startColumn: 1,
+        endLineNumber: position.lineNumber,
+        endColumn: position.column,
+      });
+
+      if (linePrefix.endsWith(".") || /\.\w*$/.test(linePrefix)) {
+        return {
+          suggestions: methods.map(([label, insertText, detail]) => ({
+            label,
+            kind: monaco.languages.CompletionItemKind.Method,
+            insertText,
+            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+            detail,
+            range,
+          })),
+        };
+      }
+
+      const suggestions = [];
+      for (const [label, insertText, detail] of builtins) {
+        suggestions.push({
+          label,
+          kind: monaco.languages.CompletionItemKind.Function,
+          insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail,
+          range,
+        });
+      }
+      for (const [label, insertText, detail] of snippets) {
+        suggestions.push({
+          label,
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail,
+          range,
+        });
+      }
+
+      // Підказка змінних та функцій із поточного коду користувача
+      const text = model.getValue();
+      const seen = new Set([...builtins.map((b) => b[0]), ...snippets.map((s) => s[0])]);
+      const matches = text.matchAll(/\b(?:def|class)\s+([a-zA-Z_]\w*)|\b([a-zA-Z_]\w*)\s*=/g);
+      for (const m of matches) {
+        const name = m[1] || m[2];
+        if (name && !seen.has(name)) {
+          seen.add(name);
+          suggestions.push({
+            label: name,
+            kind: m[1]
+              ? monaco.languages.CompletionItemKind.Function
+              : monaco.languages.CompletionItemKind.Variable,
+            insertText: name,
+            detail: "З поточного файлу",
+            range,
+          });
+        }
+      }
+
+      return { suggestions };
+    },
+  });
+}
+
+async function ensureMonaco() {
+  if (monacoEditor) return monacoEditor;
+  if (!monacoLoadPromise) {
+    monacoLoadPromise = new Promise((resolve, reject) => {
+      const loaderScript = document.createElement("script");
+      loaderScript.src = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js";
+      loaderScript.onload = () => {
+        window.require.config({
+          paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs" },
+        });
+        window.require(["vs/editor/editor.main"], () => {
+          registerPythonCompletions(window.monaco);
+          const isDark = document.documentElement.classList.contains("dark");
+          monacoEditor = window.monaco.editor.create(el.playgroundEditorContainer, {
+            value: pendingPlaygroundCode,
+            language: "python",
+            theme: isDark ? "vs-dark" : "vs",
+            automaticLayout: true,
+            minimap: { enabled: false },
+            fontSize: 13,
+            fontFamily: "'JetBrains Mono', Consolas, monospace",
+            tabSize: 4,
+            insertSpaces: true,
+            quickSuggestions: true,
+            suggestOnTriggerCharacters: true,
+            wordBasedSuggestions: "currentDocument",
+            scrollBeyondLastLine: false,
+            padding: { top: 12, bottom: 12 },
+          });
+          monacoEditor.addCommand(
+            window.monaco.KeyMod.CtrlCmd | window.monaco.KeyCode.Enter,
+            () => runPlaygroundCode()
+          );
+          resolve(monacoEditor);
+        });
+      };
+      loaderScript.onerror = reject;
+      document.head.appendChild(loaderScript);
+    });
+  }
+  return monacoLoadPromise;
+}
+
+function getPlaygroundCode() {
+  if (monacoEditor) return monacoEditor.getValue();
+  return el.playgroundCode.value || pendingPlaygroundCode;
+}
 
 async function ensurePyodide() {
   if (pyodideInstance) return pyodideInstance;
@@ -631,17 +819,26 @@ async function ensurePyodide() {
   return pyodideLoadingPromise;
 }
 
-function openPlayground(initialCode = null) {
+async function openPlayground(initialCode = null) {
   if (initialCode !== null) {
-    el.playgroundCode.value = initialCode;
-  } else if (!el.playgroundCode.value.trim()) {
-    el.playgroundCode.value = "print('Привіт, Python!')\nfor i in range(1, 6):\n    print(f'{i}^2 = {i**2}')";
+    pendingPlaygroundCode = initialCode;
   }
   showModal(el.playgroundModal);
+  try {
+    const editor = await ensureMonaco();
+    if (initialCode !== null) {
+      editor.setValue(initialCode);
+    }
+    setTimeout(() => editor.layout(), 50);
+  } catch {
+    el.playgroundEditorContainer.classList.add("hidden");
+    el.playgroundCode.classList.remove("hidden");
+    el.playgroundCode.value = pendingPlaygroundCode;
+  }
 }
 
 async function runPlaygroundCode() {
-  const code = el.playgroundCode.value;
+  const code = getPlaygroundCode();
   if (!code.trim()) return;
   el.playgroundOutput.textContent = "Запуск Python у браузері (Pyodide)...";
   try {
