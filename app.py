@@ -7,12 +7,14 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import time
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -21,11 +23,14 @@ from curriculum import CURRICULUM
 from curriculum_details import TOPIC_DETAILS
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "learning.db"
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(BASE_DIR / "learning.db")))
 STATIC_DIR = BASE_DIR / "static"
 
 SESSION_COOKIE_NAME = "pypath_session"
 SESSION_TTL_DAYS = 30
+AUTH_RATE_WINDOW_SEC = 300
+AUTH_RATE_MAX_ATTEMPTS = 10
+_auth_attempts: dict[str, list[float]] = defaultdict(list)
 
 VALID_TOPIC_IDS: set[str] = {
     topic["id"] for stage in CURRICULUM for topic in stage["topics"]
@@ -135,15 +140,37 @@ def create_session(conn: sqlite3.Connection, user_id: int) -> str:
     return token
 
 
-def set_session_cookie(response: Response, token: str) -> None:
+def set_session_cookie(response: Response, token: str, request: Request) -> None:
+    is_https = (
+        request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    )
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=token,
         httponly=True,
         samesite="lax",
+        secure=is_https,
         max_age=SESSION_TTL_DAYS * 24 * 60 * 60,
         path="/",
     )
+
+
+def check_auth_rate_limit(request: Request) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    recent = [t for t in _auth_attempts[client_ip] if now - t < AUTH_RATE_WINDOW_SEC]
+    _auth_attempts[client_ip] = recent
+    if len(recent) >= AUTH_RATE_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Забагато спроб входу. Спробуйте знову через 5 хвилин.",
+        )
+
+
+def record_auth_failure(request: Request) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    _auth_attempts[client_ip].append(time.monotonic())
 
 
 def add_xp(conn: sqlite3.Connection, user_id: int, xp_delta: int) -> None:
@@ -282,7 +309,10 @@ def auth_me(user: dict[str, Any] | None = Depends(get_optional_user)) -> dict[st
 
 
 @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, response: Response) -> dict[str, Any]:
+def register(
+    payload: RegisterRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    check_auth_rate_limit(request)
     username = payload.username.strip().lower()
     if not username.replace("_", "").replace("-", "").isalnum():
         raise HTTPException(
@@ -297,6 +327,7 @@ def register(payload: RegisterRequest, response: Response) -> dict[str, Any]:
             "SELECT id FROM users WHERE username = ?", (username,)
         ).fetchone()
         if existing:
+            record_auth_failure(request)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Користувач із таким логіном вже існує.",
@@ -308,7 +339,7 @@ def register(payload: RegisterRequest, response: Response) -> dict[str, Any]:
         user_id = cursor.lastrowid
         assert user_id is not None
         token = create_session(conn, user_id)
-        set_session_cookie(response, token)
+        set_session_cookie(response, token, request)
         user_row = conn.execute(
             "SELECT id, username, display_name, created_at FROM users WHERE id = ?",
             (user_id,),
@@ -318,7 +349,10 @@ def register(payload: RegisterRequest, response: Response) -> dict[str, Any]:
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
+def login(
+    payload: LoginRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    check_auth_rate_limit(request)
     username = payload.username.strip().lower()
     with get_db() as conn:
         user_row = conn.execute(
@@ -326,12 +360,13 @@ def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
             (username,),
         ).fetchone()
         if not user_row or not verify_password(payload.password, user_row["password_hash"]):
+            record_auth_failure(request)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Невірний логін або пароль.",
             )
         token = create_session(conn, user_row["id"])
-        set_session_cookie(response, token)
+        set_session_cookie(response, token, request)
 
     return {
         "user": {
