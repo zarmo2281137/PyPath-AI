@@ -68,6 +68,7 @@ const el = {
   playgroundEditorContainer: document.getElementById("playgroundEditorContainer"),
   playgroundCode: document.getElementById("playgroundCode"),
   playgroundStdin: document.getElementById("playgroundStdin"),
+  playgroundModeSwitch: document.getElementById("playgroundModeSwitch"),
   runCodeBtn: document.getElementById("runCodeBtn"),
   clearOutputBtn: document.getElementById("clearOutputBtn"),
   playgroundOutput: document.getElementById("playgroundOutput"),
@@ -469,13 +470,17 @@ function renderLessonTab() {
     const theoryHtml = (topic.theory || [topic.summary])
       .map((p) => `<p class="text-sm text-zinc-700 dark:text-zinc-300 leading-relaxed">${formatRichText(p)}</p>`)
       .join("");
+    const isShellSnippet =
+      /^(mkdir|cd|ls|dir|git |pip |python -m venv|\.\\\.venv)/m.test(topic.code.trim());
+    const isNonRunnable =
+      /^(CREATE TABLE|SELECT |FROM python:|server \{|# Конфіг Nginx)/m.test(topic.code.trim());
     const codeHtml = topic.code
       ? `<div class="rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-zinc-950">
            <div class="px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/60">
-             <span class="text-xs font-mono text-zinc-400">example.py</span>
+             <span class="text-xs font-mono text-zinc-400">${isShellSnippet ? "terminal" : isNonRunnable ? "snippet" : "example.py"}</span>
              <div class="flex items-center gap-2">
                <button id="copyLessonCodeBtn" class="px-2.5 py-1 rounded-md text-xs font-medium text-zinc-300 hover:bg-zinc-800 transition cursor-pointer">Копіювати</button>
-               <button id="runInPlaygroundBtn" class="px-2.5 py-1 rounded-md text-xs font-medium bg-white text-zinc-900 hover:opacity-90 transition cursor-pointer">Запустити</button>
+               ${isNonRunnable ? "" : `<button id="runInPlaygroundBtn" class="px-2.5 py-1 rounded-md text-xs font-medium bg-white text-zinc-900 hover:opacity-90 transition cursor-pointer">${isShellSnippet ? "Відкрити в терміналі" : "Запустити"}</button>`}
              </div>
            </div>
            <pre class="p-4 text-xs sm:text-sm font-mono text-zinc-100 overflow-x-auto leading-relaxed">${escapeHtml(topic.code)}</pre>
@@ -510,7 +515,7 @@ function renderLessonTab() {
     }
     const runBtn = document.getElementById("runInPlaygroundBtn");
     if (runBtn) {
-      runBtn.addEventListener("click", () => openPlayground(topic.code));
+      runBtn.addEventListener("click", () => openPlayground(topic.code, isShellSnippet ? "shell" : "python"));
     }
   } else if (state.activeLessonTab === "quiz") {
     const quiz = topic.quiz || [];
@@ -624,7 +629,162 @@ let pyodideInstance = null;
 let pyodideLoadingPromise = null;
 let monacoEditor = null;
 let monacoLoadPromise = null;
+let playgroundMode = "python";
 let pendingPlaygroundCode = "print('Привіт, Python!')\nfor i in range(1, 6):\n    print(f'{i}^2 = {i**2}')";
+
+const vfsState = {
+  cwd: "/home/student",
+  dirs: new Set(["/", "/home", "/home/student"]),
+  files: { "/home/student/hello.py": "print('Привіт з файлу!')\n" },
+};
+
+function vfsResolve(rawPath) {
+  let p = (rawPath || "").replace(/\\/g, "/").trim();
+  if (!p || p === "~") return "/home/student";
+  const parts = p.startsWith("/") ? [] : vfsState.cwd.split("/").filter(Boolean);
+  for (const seg of p.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return "/" + parts.join("/");
+}
+
+async function runVirtualShell(script) {
+  const out = [];
+  const lines = script.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    out.push(`$ ${line}`);
+
+    // type nul > file.py (Windows) or echo ... > file
+    const typeNulMatch = line.match(/^type\s+nul\s*>\s*(.+)$/i);
+    if (typeNulMatch) {
+      const target = vfsResolve(typeNulMatch[1].replace(/^["']|["']$/g, ""));
+      vfsState.files[target] = vfsState.files[target] ?? "";
+      continue;
+    }
+
+    const echoRedirMatch = line.match(/^echo\s+(.+?)\s*(>>?)\s*(.+)$/i);
+    if (echoRedirMatch) {
+      const text = echoRedirMatch[1].replace(/^["']|["']$/g, "");
+      const append = echoRedirMatch[2] === ">>";
+      const target = vfsResolve(echoRedirMatch[3].replace(/^["']|["']$/g, ""));
+      vfsState.files[target] = (append ? vfsState.files[target] || "" : "") + text + "\n";
+      continue;
+    }
+
+    const tokens = line.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+    const cmd = (tokens[0] || "").toLowerCase();
+    const args = tokens.slice(1).map((a) => a.replace(/^["']|["']$/g, ""));
+
+    if (cmd === "pwd") {
+      out.push(vfsState.cwd);
+    } else if (cmd === "mkdir") {
+      if (!args[0]) out.push("mkdir: вкажіть назву папки");
+      for (const a of args) {
+        if (!a.startsWith("-")) vfsState.dirs.add(vfsResolve(a));
+      }
+    } else if (cmd === "cd") {
+      const target = vfsResolve(args[0] || "~");
+      if (vfsState.dirs.has(target)) vfsState.cwd = target;
+      else out.push(`cd: папку не знайдено: ${args[0]}`);
+    } else if (cmd === "touch") {
+      for (const a of args) {
+        const target = vfsResolve(a);
+        vfsState.files[target] = vfsState.files[target] ?? "";
+      }
+    } else if (cmd === "ls" || cmd === "dir") {
+      const prefix = vfsState.cwd === "/" ? "/" : vfsState.cwd + "/";
+      const items = [];
+      for (const d of vfsState.dirs) {
+        if (d.startsWith(prefix) && !d.slice(prefix.length).includes("/")) {
+          items.push(d.slice(prefix.length) + "/");
+        }
+      }
+      for (const f of Object.keys(vfsState.files)) {
+        if (f.startsWith(prefix) && !f.slice(prefix.length).includes("/")) {
+          items.push(f.slice(prefix.length));
+        }
+      }
+      out.push(items.length ? items.sort().join("  ") : "(порожньо)");
+    } else if (cmd === "cat" || cmd === "type") {
+      const target = vfsResolve(args[0]);
+      if (target in vfsState.files) out.push(vfsState.files[target] || "(порожній файл)");
+      else out.push(`${cmd}: файл не знайдено: ${args[0]}`);
+    } else if (cmd === "rm" || cmd === "del") {
+      for (const a of args) {
+        if (a.startsWith("-")) continue;
+        const target = vfsResolve(a);
+        delete vfsState.files[target];
+        vfsState.dirs.delete(target);
+      }
+    } else if (cmd === "echo") {
+      out.push(args.join(" "));
+    } else if (cmd === "python" || cmd === "python3") {
+      if (args[0] === "--version" || args[0] === "-V") {
+        out.push("Python 3.12.x (Pyodide WebAssembly)");
+      } else if (args[0] === "-m" && args[1] === "venv") {
+        vfsState.dirs.add(vfsResolve(args[2] || ".venv"));
+        out.push(`Створено віртуальне оточення ${args[2] || ".venv"}`);
+      } else if (args[0] && vfsResolve(args[0]) in vfsState.files) {
+        const fileCode = vfsState.files[vfsResolve(args[0])];
+        const pyRes = await executePythonCode(fileCode, "");
+        if (pyRes.text) out.push(pyRes.text);
+      } else {
+        out.push("Використання: python --version | python <файл.py> | python -m venv .venv");
+      }
+    } else if (cmd === "pip") {
+      if (args[0] === "list" || args[0] === "freeze") {
+        out.push("fastapi==0.115.0\nuvicorn==0.30.0\npydantic==2.9.0");
+      } else if (args[0] === "install") {
+        out.push(`Successfully installed ${args.slice(1).join(" ") || "packages"}`);
+      } else {
+        out.push("pip: спробуйте pip install <пакет> або pip list");
+      }
+    } else if (cmd === "git") {
+      if (args[0] === "init") out.push(`Initialized empty Git repository in ${vfsState.cwd}/.git/`);
+      else if (args[0] === "status") out.push("On branch main\nnothing to commit, working tree clean");
+      else out.push(`git ${args.join(" ")}: виконано (симуляція)`);
+    } else if (cmd === "help") {
+      out.push("Команди: pwd, ls, dir, cd, mkdir, touch, type nul > файл, echo, cat, rm, python, pip, git");
+    } else {
+      out.push(`${cmd}: команду не розпізнано (введіть 'help' для списку команд)`);
+    }
+  }
+  return out.join("\n") || "(Готово)";
+}
+
+function looksLikeShellScript(code) {
+  const firstNonEmpty = code
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith("#"));
+  if (!firstNonEmpty) return false;
+  return /^(mkdir|cd|ls|dir|pwd|touch|type\s+nul|rm|del|cat|git|pip|python\s+--version|python\s+-m\s+venv|\.\\\.venv)\b/i.test(
+    firstNonEmpty
+  );
+}
+
+function setPlaygroundMode(mode) {
+  playgroundMode = mode;
+  if (el.playgroundModeSwitch) {
+    const activeCls =
+      "px-2.5 py-1 rounded-md font-medium bg-white dark:bg-zinc-950 text-zinc-900 dark:text-white shadow-2xs transition cursor-pointer";
+    const idleCls =
+      "px-2.5 py-1 rounded-md font-medium text-zinc-500 hover:text-zinc-900 dark:hover:text-white transition cursor-pointer";
+    for (const btn of el.playgroundModeSwitch.querySelectorAll("button[data-pgmode]")) {
+      btn.className = btn.dataset.pgmode === mode ? activeCls : idleCls;
+    }
+  }
+  if (window.monaco && monacoEditor) {
+    window.monaco.editor.setModelLanguage(
+      monacoEditor.getModel(),
+      mode === "shell" ? "shell" : "python"
+    );
+  }
+}
 
 function registerPythonCompletions(monaco) {
   const builtins = [
@@ -829,16 +989,19 @@ async function ensurePyodide() {
   return pyodideLoadingPromise;
 }
 
-async function openPlayground(initialCode = null) {
+async function openPlayground(initialCode = null, mode = null) {
   if (initialCode !== null) {
     pendingPlaygroundCode = initialCode;
   }
+  const targetMode = mode || (initialCode && looksLikeShellScript(initialCode) ? "shell" : playgroundMode);
+  setPlaygroundMode(targetMode);
   showModal(el.playgroundModal);
   try {
     const editor = await ensureMonaco();
     if (initialCode !== null) {
       editor.setValue(initialCode);
     }
+    setPlaygroundMode(targetMode);
     setTimeout(() => editor.layout(), 50);
   } catch {
     el.playgroundEditorContainer.classList.add("hidden");
@@ -847,11 +1010,7 @@ async function openPlayground(initialCode = null) {
   }
 }
 
-async function runPlaygroundCode() {
-  const code = getPlaygroundCode();
-  if (!code.trim()) return;
-  const stdinRaw = el.playgroundStdin ? el.playgroundStdin.value : "";
-  el.playgroundOutput.textContent = "Запуск Python у браузері (Pyodide)...";
+async function executePythonCode(code, stdinRaw) {
   try {
     const pyodide = await ensurePyodide();
     const outLines = [];
@@ -867,9 +1026,7 @@ async function runPlaygroundCode() {
         return val;
       }
       const res = window.prompt(promptText || "Введіть значення для input():");
-      if (res === null) {
-        throw new Error("EOFError: Користувач скасував введення");
-      }
+      if (res === null) return null;
       outLines.push(`${promptText}${res}`);
       return res;
     });
@@ -877,12 +1034,21 @@ async function runPlaygroundCode() {
     await pyodide.runPythonAsync(`
 import builtins
 def _pypath_custom_input(prompt=""):
-    return __pypath_input__(str(prompt))
+    val = __pypath_input__(str(prompt))
+    if val is None:
+        raise EOFError("Введення скасовано")
+    return val
 builtins.input = _pypath_custom_input
 `);
 
-    await pyodide.runPythonAsync(code);
-    el.playgroundOutput.textContent = outLines.join("\n") || "(Програма завершилась без виводу)";
+    // У Pyodide вже запущено event loop, тому asyncio.run(coro) замінюємо на await coro
+    const normalizedCode = code.replace(
+      /^([ \t]*)asyncio\.run\((.+)\)\s*$/gm,
+      "$1await $2"
+    );
+
+    await pyodide.runPythonAsync(normalizedCode);
+    return { text: outLines.join("\n") || "(Програма завершилась без виводу)", isError: false };
   } catch (pyErr) {
     if (String(pyErr).includes("loadPyodide") || String(pyErr).includes("Failed to fetch")) {
       try {
@@ -891,14 +1057,41 @@ builtins.input = _pypath_custom_input
           body: JSON.stringify({ code, stdin: stdinRaw }),
         });
         const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
-        el.playgroundOutput.textContent = out || "(Програма завершилась без виводу)";
+        return {
+          text: out || "(Програма завершилась без виводу)",
+          isError: res.returncode !== 0,
+        };
       } catch (err) {
-        el.playgroundOutput.textContent = `Помилка: ${err.message}`;
+        return { text: `Помилка: ${err.message}`, isError: true };
       }
-    } else {
-      el.playgroundOutput.textContent = String(pyErr);
     }
+    return { text: String(pyErr), isError: true };
   }
+}
+
+async function runPlaygroundCode() {
+  const code = getPlaygroundCode();
+  if (!code.trim()) return;
+  const stdinRaw = el.playgroundStdin ? el.playgroundStdin.value : "";
+
+  el.playgroundOutput.classList.remove("text-rose-400");
+  el.playgroundOutput.classList.add("text-emerald-400");
+
+  // Автовизначення команд терміналу (mkdir, cd, type nul >, ls, dir...)
+  if (playgroundMode === "shell" || looksLikeShellScript(code)) {
+    if (playgroundMode !== "shell") {
+      setPlaygroundMode("shell");
+      showToast("Перемкнено в режим Термінал (CLI)");
+    }
+    el.playgroundOutput.textContent = await runVirtualShell(code);
+    return;
+  }
+
+  el.playgroundOutput.textContent = "Запуск Python у браузері (Pyodide)...";
+  const result = await executePythonCode(code, stdinRaw);
+  el.playgroundOutput.classList.toggle("text-rose-400", result.isError);
+  el.playgroundOutput.classList.toggle("text-emerald-400", !result.isError);
+  el.playgroundOutput.textContent = result.text;
 }
 
 /* ---------- Flashcards ---------- */
@@ -1066,7 +1259,22 @@ function bindEvents() {
   el.openPlaygroundBtn.addEventListener("click", () => openPlayground());
   el.closePlaygroundBtn.addEventListener("click", () => hideModal(el.playgroundModal));
   el.playgroundModal.addEventListener("click", (e) => { if (e.target === el.playgroundModal) hideModal(el.playgroundModal); });
+  if (el.playgroundModeSwitch) {
+    el.playgroundModeSwitch.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-pgmode]");
+      if (!btn) return;
+      setPlaygroundMode(btn.dataset.pgmode);
+    });
+  }
   el.runCodeBtn.addEventListener("click", runPlaygroundCode);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      hideModal(el.lessonModal);
+      hideModal(el.playgroundModal);
+      hideModal(el.flashcardsModal);
+      closeAuthModal();
+    }
+  });
   el.clearOutputBtn.addEventListener("click", () => { el.playgroundOutput.textContent = ""; });
   el.playgroundCode.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key === "Enter") {
