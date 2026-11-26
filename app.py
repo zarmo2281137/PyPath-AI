@@ -325,6 +325,7 @@ class QuizSubmission(BaseModel):
 
 class PlaygroundRequest(BaseModel):
     code: str = Field(min_length=1, max_length=4000)
+    stdin: str = Field(default="", max_length=4000)
 
 
 @app.get("/")
@@ -639,6 +640,7 @@ def run_python_playground(payload: PlaygroundRequest) -> dict[str, Any]:
     try:
         proc = subprocess.run(
             [sys.executable, "-X", "utf8", "-I", "-c", payload.code],
+            input=payload.stdin,
             capture_output=True,
             text=True,
             encoding="utf-8",

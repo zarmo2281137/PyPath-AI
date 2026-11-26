@@ -67,6 +67,7 @@ const el = {
   closePlaygroundBtn: document.getElementById("closePlaygroundBtn"),
   playgroundEditorContainer: document.getElementById("playgroundEditorContainer"),
   playgroundCode: document.getElementById("playgroundCode"),
+  playgroundStdin: document.getElementById("playgroundStdin"),
   runCodeBtn: document.getElementById("runCodeBtn"),
   clearOutputBtn: document.getElementById("clearOutputBtn"),
   playgroundOutput: document.getElementById("playgroundOutput"),
@@ -840,12 +841,37 @@ async function openPlayground(initialCode = null) {
 async function runPlaygroundCode() {
   const code = getPlaygroundCode();
   if (!code.trim()) return;
+  const stdinRaw = el.playgroundStdin ? el.playgroundStdin.value : "";
   el.playgroundOutput.textContent = "Запуск Python у браузері (Pyodide)...";
   try {
     const pyodide = await ensurePyodide();
     const outLines = [];
     pyodide.setStdout({ batched: (msg) => outLines.push(msg) });
     pyodide.setStderr({ batched: (msg) => outLines.push(msg) });
+
+    const stdinLines = stdinRaw.length ? stdinRaw.split(/\r?\n/) : [];
+    let stdinIdx = 0;
+    pyodide.globals.set("__pypath_input__", (promptText = "") => {
+      if (stdinIdx < stdinLines.length) {
+        const val = stdinLines[stdinIdx++];
+        outLines.push(`${promptText}${val}`);
+        return val;
+      }
+      const res = window.prompt(promptText || "Введіть значення для input():");
+      if (res === null) {
+        throw new Error("EOFError: Користувач скасував введення");
+      }
+      outLines.push(`${promptText}${res}`);
+      return res;
+    });
+
+    await pyodide.runPythonAsync(`
+import builtins
+def _pypath_custom_input(prompt=""):
+    return __pypath_input__(str(prompt))
+builtins.input = _pypath_custom_input
+`);
+
     await pyodide.runPythonAsync(code);
     el.playgroundOutput.textContent = outLines.join("\n") || "(Програма завершилась без виводу)";
   } catch (pyErr) {
@@ -853,7 +879,7 @@ async function runPlaygroundCode() {
       try {
         const res = await api("/api/playground/run", {
           method: "POST",
-          body: JSON.stringify({ code }),
+          body: JSON.stringify({ code, stdin: stdinRaw }),
         });
         const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
         el.playgroundOutput.textContent = out || "(Програма завершилась без виводу)";
