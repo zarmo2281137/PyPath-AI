@@ -117,6 +117,15 @@ function escapeHtml(str) {
     .replaceAll('"', "&quot;");
 }
 
+function formatRichText(str) {
+  return escapeHtml(str)
+    .replace(/\*\*(.+?)\*\*/g, '<strong class="font-semibold text-zinc-900 dark:text-zinc-100">$1</strong>')
+    .replace(
+      /`([^`]+)`/g,
+      '<code class="px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 font-mono text-[12px] text-zinc-800 dark:text-zinc-200">$1</code>'
+    );
+}
+
 async function api(url, options = {}) {
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -458,7 +467,7 @@ function renderLessonTab() {
 
   if (state.activeLessonTab === "theory") {
     const theoryHtml = (topic.theory || [topic.summary])
-      .map((p) => `<p class="text-sm text-zinc-700 dark:text-zinc-300 leading-relaxed">${escapeHtml(p)}</p>`)
+      .map((p) => `<p class="text-sm text-zinc-700 dark:text-zinc-300 leading-relaxed">${formatRichText(p)}</p>`)
       .join("");
     const codeHtml = topic.code
       ? `<div class="rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-zinc-950">
