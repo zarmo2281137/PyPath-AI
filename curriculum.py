@@ -158,6 +158,20 @@ CURRICULUM = [
                 "summary": "Анотації типів у функціях (def get_user(user_id: int) -> dict[str, Any] | None:).",
                 "tags": ["Type Hints", "typing", "Any", "Union |"],
                 "practice": "Додайте повну типізацію до попередніх модулів проєкту."
+            },
+            {
+                "id": "s2-logging",
+                "title": "Логування (logging / structlog)",
+                "summary": "Рівні логів (DEBUG, INFO, WARNING, ERROR, CRITICAL), форматери, ротація файлів та структуровані JSON-логи замість print().",
+                "tags": ["logging", "structlog", "JSON logs", "RotatingFileHandler"],
+                "practice": "Замініть усі print() у скрипті на налаштований logger із рівнями INFO та ERROR."
+            },
+            {
+                "id": "s2-stdlib",
+                "title": "Потужні інструменти stdlib (collections, itertools, functools)",
+                "summary": "Counter, defaultdict, lru_cache / cache, itertools (chain, islice, batched) — готові швидкі рішення зі стандартної бібліотеки.",
+                "tags": ["Counter", "defaultdict", "lru_cache", "itertools"],
+                "practice": "Використайте Counter та @lru_cache для оптимізації підрахунків і рекурсії."
             }
         ]
     },
@@ -269,6 +283,13 @@ CURRICULUM = [
                 "summary": "Різниця між Threads, Multiprocessing (обхід GIL) та Event Loop. async def, await, asyncio.gather, asyncio.create_task, asyncio.Semaphore.",
                 "tags": ["asyncio", "GIL", "Event Loop", "gather", "Semaphore"],
                 "practice": "Виконайте 50 асинхронних HTTP-запитів паралельно з обмеженням через Semaphore(5)."
+            },
+            {
+                "id": "s5-websockets",
+                "title": "Real-time: WebSockets та Server-Sent Events (SSE)",
+                "summary": "Двосторонній зв'язок у реальному часі (WebSockets) та потокова передача токенів від AI-моделей (SSE / StreamingResponse).",
+                "tags": ["WebSockets", "SSE", "Streaming", "Real-time"],
+                "practice": "Реалізуйте простий SSE-ендпоінт у FastAPI, який віддає текст по словах із затримкою."
             }
         ]
     },
@@ -306,6 +327,13 @@ CURRICULUM = [
                 "summary": "Зберігання «ключ-значення» в RAM, TTL (час життя запису), кешування важких запитів, зберігання станів користувачів.",
                 "tags": ["Redis", "TTL", "Caching", "In-memory"],
                 "practice": "Додайте кешування відповідей з TTL 60 секунд у Redis."
+            },
+            {
+                "id": "s6-sql-perf",
+                "title": "Оптимізація SQL та проблема N+1 в ORM",
+                "summary": "Як знайти повільні запити через EXPLAIN ANALYZE та вирішити проблему N+1 запитів у SQLAlchemy через selectinload / joinedload.",
+                "tags": ["EXPLAIN ANALYZE", "N+1 Problem", "selectinload", "Query Optimization"],
+                "practice": "Порівняйте кількість SQL-запитів до та після додавання selectinload()."
             }
         ]
     },
@@ -336,6 +364,20 @@ CURRICULUM = [
                 "summary": "Статичні сайти (httpx + BeautifulSoup4 / selectolax), динамічні сайти з JS (Playwright), робота з проксі, User-Agent та затримками.",
                 "tags": ["BeautifulSoup4", "selectolax", "Playwright", "Proxies"],
                 "practice": "Напишіть асинхронний парсер новин або цін зі збереженням у БД."
+            },
+            {
+                "id": "s7-auth-security",
+                "title": "Автентифікація та безпека API (JWT, RBAC, Rate Limit)",
+                "summary": "Хешування паролів (bcrypt / argon2 / PBKDF2), Access & Refresh JWT-токени, ролі доступу (RBAC) та захист від brute-force.",
+                "tags": ["JWT", "bcrypt/argon2", "OAuth2", "RBAC", "Rate Limiting"],
+                "practice": "Реалізуйте реєстрацію, логін із JWT та захищений ендпоінт лише для ролі admin."
+            },
+            {
+                "id": "s7-queues",
+                "title": "Фонові задачі та черги (ARQ / Celery / Taskiq)",
+                "summary": "Асинхронна обробка важких задач у окремих воркерах (парсинг, індексація RAG, розсилки) через Redis без блокування API.",
+                "tags": ["Celery", "ARQ", "Taskiq", "Workers", "Queues"],
+                "practice": "Винесіть довгу генерацію звіту у фонового воркера через Redis."
             }
         ]
     },
@@ -373,6 +415,13 @@ CURRICULUM = [
                 "summary": "Фолбеки між провайдерами, таймаути, захист від Prompt Injection, логування запитів і відповідей.",
                 "tags": ["Fallbacks", "Prompt Injection", "Observability"],
                 "practice": "Реалізуйте автоматичний fallback на резервну модель при таймауті основної."
+            },
+            {
+                "id": "s8-agents-evals",
+                "title": "AI-агенти (LangGraph) та оцінка якості (Evals)",
+                "summary": "Багатокрокові агенти з пам'яттю та станом (LangGraph), а також автоматичне тестування точності RAG і промптів (LLM-as-a-Judge).",
+                "tags": ["AI Agents", "LangGraph", "Evals", "LLM-as-a-Judge"],
+                "practice": "Зберіть набір із 15 тестових питань для вашого RAG і оцініть точність відповідей."
             }
         ]
     },
@@ -403,6 +452,13 @@ CURRICULUM = [
                 "summary": "VPS (Ubuntu Linux), SSH-ключі, фаєрвол (ufw), DNS A-записи, Nginx (reverse proxy) + HTTPS через Certbot, базовий CI/CD у GitHub Actions.",
                 "tags": ["Linux VPS", "SSH", "Nginx", "Certbot", "GitHub Actions"],
                 "practice": "Задеплойте FastAPI-додаток на VPS із доменом, HTTPS та автотестами у GitHub Actions."
+            },
+            {
+                "id": "s9-monitoring",
+                "title": "Моніторинг, алерти та Sentry",
+                "summary": "Відстеження помилок у продакшені (Sentry), healthcheck-ендпоінти, базові метрики (Prometheus / Grafana) та алерти в Telegram.",
+                "tags": ["Sentry", "Prometheus", "Grafana", "Healthcheck", "Alerts"],
+                "practice": "Підключіть Sentry SDK до FastAPI або налаштуйте алерт у Telegram при 500-й помилці."
             }
         ]
     },
