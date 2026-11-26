@@ -605,7 +605,32 @@ function renderLessonTab() {
   }
 }
 
-/* ---------- Playground ---------- */
+/* ---------- Playground (Pyodide in-browser + API fallback) ---------- */
+let pyodideInstance = null;
+let pyodideLoadingPromise = null;
+
+async function ensurePyodide() {
+  if (pyodideInstance) return pyodideInstance;
+  if (!pyodideLoadingPromise) {
+    pyodideLoadingPromise = (async () => {
+      if (!window.loadPyodide) {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "https://cdn.jsdelivr.net/pyodide/v0.27.8/full/pyodide.js";
+          s.onload = resolve;
+          s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+      pyodideInstance = await window.loadPyodide({
+        indexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.8/full/",
+      });
+      return pyodideInstance;
+    })();
+  }
+  return pyodideLoadingPromise;
+}
+
 function openPlayground(initialCode = null) {
   if (initialCode !== null) {
     el.playgroundCode.value = initialCode;
@@ -618,16 +643,29 @@ function openPlayground(initialCode = null) {
 async function runPlaygroundCode() {
   const code = el.playgroundCode.value;
   if (!code.trim()) return;
-  el.playgroundOutput.textContent = "Виконання...";
+  el.playgroundOutput.textContent = "Запуск Python у браузері (Pyodide)...";
   try {
-    const res = await api("/api/playground/run", {
-      method: "POST",
-      body: JSON.stringify({ code }),
-    });
-    const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
-    el.playgroundOutput.textContent = out || "(Програма завершилась без виводу)";
-  } catch (err) {
-    el.playgroundOutput.textContent = `Помилка: ${err.message}`;
+    const pyodide = await ensurePyodide();
+    const outLines = [];
+    pyodide.setStdout({ batched: (msg) => outLines.push(msg) });
+    pyodide.setStderr({ batched: (msg) => outLines.push(msg) });
+    await pyodide.runPythonAsync(code);
+    el.playgroundOutput.textContent = outLines.join("\n") || "(Програма завершилась без виводу)";
+  } catch (pyErr) {
+    if (String(pyErr).includes("loadPyodide") || String(pyErr).includes("Failed to fetch")) {
+      try {
+        const res = await api("/api/playground/run", {
+          method: "POST",
+          body: JSON.stringify({ code }),
+        });
+        const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
+        el.playgroundOutput.textContent = out || "(Програма завершилась без виводу)";
+      } catch (err) {
+        el.playgroundOutput.textContent = `Помилка: ${err.message}`;
+      }
+    } else {
+      el.playgroundOutput.textContent = String(pyErr);
+    }
   }
 }
 

@@ -23,7 +23,11 @@ from curriculum import CURRICULUM
 from curriculum_details import TOPIC_DETAILS
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("DATABASE_PATH", str(BASE_DIR / "learning.db")))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DEFAULT_SQLITE_PATH = (
+    "/tmp/learning.db" if os.environ.get("VERCEL") else str(BASE_DIR / "learning.db")
+)
+DB_PATH = Path(os.environ.get("DATABASE_PATH", DEFAULT_SQLITE_PATH))
 STATIC_DIR = BASE_DIR / "static"
 
 SESSION_COOKIE_NAME = "pypath_session"
@@ -36,7 +40,7 @@ VALID_TOPIC_IDS: set[str] = {
     topic["id"] for stage in CURRICULUM for topic in stage["topics"]
 }
 
-app = FastAPI(title="PyPath AI — Навчальна платформа", version="2.0.0")
+app = FastAPI(title="PyPath AI — Навчальна платформа", version="2.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -48,63 +52,111 @@ def today_iso() -> str:
     return date.today().isoformat()
 
 
+class DbWrapper:
+    """Уніфікована обгортка для SQLite (локально) та PostgreSQL (Vercel / Neon / Supabase)."""
+
+    def __init__(self, conn: Any, is_pg: bool) -> None:
+        self.conn = conn
+        self.is_pg = is_pg
+
+    def _sql(self, query: str) -> str:
+        return query.replace("?", "%s") if self.is_pg else query
+
+    def execute(self, query: str, params: tuple[Any, ...] = ()) -> Any:
+        return self.conn.execute(self._sql(query), params)
+
+    def fetchone(self, query: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        row = self.execute(query, params).fetchone()
+        return dict(row) if row is not None else None
+
+    def fetchall(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        rows = self.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        db = DbWrapper(conn, is_pg=True)
+        try:
+            yield db
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        db = DbWrapper(conn, is_pg=False)
+        try:
+            yield db
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def init_db() -> None:
-    with get_db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                display_name TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS topic_progress (
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                topic_id TEXT NOT NULL,
-                completed INTEGER NOT NULL DEFAULT 0,
-                notes TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, topic_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS quiz_results (
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                topic_id TEXT NOT NULL,
-                score INTEGER NOT NULL,
-                total INTEGER NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, topic_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS study_activity (
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                activity_date TEXT NOT NULL,
-                xp INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, activity_date)
-            );
-            """
+    id_col = "SERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    statements = [
+        f"""
+        CREATE TABLE IF NOT EXISTS users (
+            id {id_col},
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS topic_progress (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            topic_id TEXT NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, topic_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS quiz_results (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            topic_id TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, topic_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS study_activity (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            activity_date TEXT NOT NULL,
+            xp INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, activity_date)
+        )
+        """,
+    ]
+    with get_db() as db:
+        for stmt in statements:
+            db.execute(stmt)
 
 
 init_db()
@@ -129,11 +181,11 @@ def verify_password(password: str, stored_hash: str) -> bool:
     return hmac.compare_digest(actual_digest, expected_digest)
 
 
-def create_session(conn: sqlite3.Connection, user_id: int) -> str:
+def create_session(db: DbWrapper, user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
     expires = now + timedelta(days=SESSION_TTL_DAYS)
-    conn.execute(
+    db.execute(
         "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
         (token, user_id, now.isoformat(), expires.isoformat()),
     )
@@ -173,10 +225,10 @@ def record_auth_failure(request: Request) -> None:
     _auth_attempts[client_ip].append(time.monotonic())
 
 
-def add_xp(conn: sqlite3.Connection, user_id: int, xp_delta: int) -> None:
+def add_xp(db: DbWrapper, user_id: int, xp_delta: int) -> None:
     if xp_delta <= 0:
         return
-    conn.execute(
+    db.execute(
         """
         INSERT INTO study_activity (user_id, activity_date, xp)
         VALUES (?, ?, ?)
@@ -187,11 +239,11 @@ def add_xp(conn: sqlite3.Connection, user_id: int, xp_delta: int) -> None:
     )
 
 
-def compute_streak(conn: sqlite3.Connection, user_id: int) -> tuple[int, int]:
-    rows = conn.execute(
+def compute_streak(db: DbWrapper, user_id: int) -> tuple[int, int]:
+    rows = db.fetchall(
         "SELECT activity_date, xp FROM study_activity WHERE user_id = ? ORDER BY activity_date DESC",
         (user_id,),
-    ).fetchall()
+    )
     total_xp = sum(r["xp"] for r in rows)
     active_dates = {date.fromisoformat(r["activity_date"]) for r in rows if r["xp"] > 0}
     if not active_dates:
@@ -211,8 +263,8 @@ def get_optional_user(
 ) -> dict[str, Any] | None:
     if not session_token:
         return None
-    with get_db() as conn:
-        row = conn.execute(
+    with get_db() as db:
+        row = db.fetchone(
             """
             SELECT u.id, u.username, u.display_name, u.created_at, s.expires_at
             FROM sessions s
@@ -220,11 +272,11 @@ def get_optional_user(
             WHERE s.token = ?
             """,
             (session_token,),
-        ).fetchone()
+        )
         if not row:
             return None
         if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
-            conn.execute("DELETE FROM sessions WHERE token = ?", (session_token,))
+            db.execute("DELETE FROM sessions WHERE token = ?", (session_token,))
             return None
         return {
             "id": row["id"],
@@ -278,6 +330,11 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "db": "postgres" if DATABASE_URL else "sqlite"}
+
+
 @app.get("/api/curriculum")
 def get_curriculum() -> dict[str, Any]:
     enriched_stages = []
@@ -322,30 +379,39 @@ def register(
     display_name = payload.display_name.strip() or payload.username.strip()
     pw_hash = hash_password(payload.password)
 
-    with get_db() as conn:
-        existing = conn.execute(
+    with get_db() as db:
+        existing = db.fetchone(
             "SELECT id FROM users WHERE username = ?", (username,)
-        ).fetchone()
+        )
         if existing:
             record_auth_failure(request)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Користувач із таким логіном вже існує.",
             )
-        cursor = conn.execute(
-            "INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?)",
-            (username, display_name, pw_hash, utc_now_iso()),
-        )
-        user_id = cursor.lastrowid
-        assert user_id is not None
-        token = create_session(conn, user_id)
-        set_session_cookie(response, token, request)
-        user_row = conn.execute(
-            "SELECT id, username, display_name, created_at FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
+        if db.is_pg:
+            user_row = db.fetchone(
+                "INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?) RETURNING id, username, display_name, created_at",
+                (username, display_name, pw_hash, utc_now_iso()),
+            )
+            assert user_row is not None
+            user_id = user_row["id"]
+        else:
+            cursor = db.execute(
+                "INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (username, display_name, pw_hash, utc_now_iso()),
+            )
+            user_id = cursor.lastrowid
+            assert user_id is not None
+            user_row = db.fetchone(
+                "SELECT id, username, display_name, created_at FROM users WHERE id = ?",
+                (user_id,),
+            )
 
-    return {"user": dict(user_row)}
+        token = create_session(db, user_id)
+        set_session_cookie(response, token, request)
+
+    return {"user": user_row}
 
 
 @app.post("/api/auth/login")
@@ -354,18 +420,18 @@ def login(
 ) -> dict[str, Any]:
     check_auth_rate_limit(request)
     username = payload.username.strip().lower()
-    with get_db() as conn:
-        user_row = conn.execute(
+    with get_db() as db:
+        user_row = db.fetchone(
             "SELECT id, username, display_name, password_hash, created_at FROM users WHERE username = ?",
             (username,),
-        ).fetchone()
+        )
         if not user_row or not verify_password(payload.password, user_row["password_hash"]):
             record_auth_failure(request)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Невірний логін або пароль.",
             )
-        token = create_session(conn, user_row["id"])
+        token = create_session(db, user_row["id"])
         set_session_cookie(response, token, request)
 
     return {
@@ -384,24 +450,24 @@ def logout(
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> dict[str, bool]:
     if session_token:
-        with get_db() as conn:
-            conn.execute("DELETE FROM sessions WHERE token = ?", (session_token,))
+        with get_db() as db:
+            db.execute("DELETE FROM sessions WHERE token = ?", (session_token,))
     response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
     return {"ok": True}
 
 
 @app.get("/api/progress")
 def get_progress(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    with get_db() as conn:
-        rows = conn.execute(
+    with get_db() as db:
+        rows = db.fetchall(
             "SELECT topic_id, completed, notes FROM topic_progress WHERE user_id = ?",
             (user["id"],),
-        ).fetchall()
-        quiz_rows = conn.execute(
+        )
+        quiz_rows = db.fetchall(
             "SELECT topic_id, score, total FROM quiz_results WHERE user_id = ?",
             (user["id"],),
-        ).fetchall()
-        streak_days, total_xp = compute_streak(conn, user["id"])
+        )
+        streak_days, total_xp = compute_streak(db, user["id"])
 
     completed = [r["topic_id"] for r in rows if r["completed"]]
     notes = {r["topic_id"]: r["notes"] for r in rows if r["notes"]}
@@ -430,11 +496,11 @@ def update_topic_progress(
         )
 
     now = utc_now_iso()
-    with get_db() as conn:
-        existing = conn.execute(
+    with get_db() as db:
+        existing = db.fetchone(
             "SELECT completed, notes FROM topic_progress WHERE user_id = ? AND topic_id = ?",
             (user["id"], topic_id),
-        ).fetchone()
+        )
 
         was_completed = bool(existing["completed"]) if existing else False
         new_completed = (
@@ -448,7 +514,7 @@ def update_topic_progress(
             else (existing["notes"] if existing else "")
         )
 
-        conn.execute(
+        db.execute(
             """
             INSERT INTO topic_progress (user_id, topic_id, completed, notes, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -461,11 +527,11 @@ def update_topic_progress(
         )
 
         if not was_completed and new_completed:
-            add_xp(conn, user["id"], 20)
+            add_xp(db, user["id"], 20)
         elif payload.notes is not None and payload.notes.strip():
-            add_xp(conn, user["id"], 5)
+            add_xp(db, user["id"], 5)
 
-        streak_days, total_xp = compute_streak(conn, user["id"])
+        streak_days, total_xp = compute_streak(db, user["id"])
 
     return {
         "topic_id": topic_id,
@@ -484,9 +550,9 @@ def sync_bulk_progress(
 ) -> dict[str, Any]:
     now = utc_now_iso()
     valid_ids = [tid for tid in payload.completed_ids if tid in VALID_TOPIC_IDS]
-    with get_db() as conn:
+    with get_db() as db:
         for tid in valid_ids:
-            conn.execute(
+            db.execute(
                 """
                 INSERT INTO topic_progress (user_id, topic_id, completed, notes, updated_at)
                 VALUES (?, ?, 1, '', ?)
@@ -497,7 +563,7 @@ def sync_bulk_progress(
                 (user["id"], tid, now),
             )
         if valid_ids:
-            add_xp(conn, user["id"], 20 * len(valid_ids))
+            add_xp(db, user["id"], 20 * len(valid_ids))
     return {"synced_count": len(valid_ids)}
 
 
@@ -530,13 +596,13 @@ def submit_quiz(
     streak_days = 0
     total_xp = 0
     if user:
-        with get_db() as conn:
-            prev = conn.execute(
+        with get_db() as db:
+            prev = db.fetchone(
                 "SELECT score, total FROM quiz_results WHERE user_id = ? AND topic_id = ?",
                 (user["id"], topic_id),
-            ).fetchone()
+            )
             best_score = max(score, prev["score"]) if prev else score
-            conn.execute(
+            db.execute(
                 """
                 INSERT INTO quiz_results (user_id, topic_id, score, total, updated_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -549,8 +615,8 @@ def submit_quiz(
             )
             if passed and (not prev or prev["score"] < total):
                 xp_earned = 30
-                add_xp(conn, user["id"], xp_earned)
-            streak_days, total_xp = compute_streak(conn, user["id"])
+                add_xp(db, user["id"], xp_earned)
+            streak_days, total_xp = compute_streak(db, user["id"])
 
     return {
         "topic_id": topic_id,
